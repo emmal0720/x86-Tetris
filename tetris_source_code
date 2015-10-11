@@ -1,0 +1,3375 @@
+	assume cs:code, ds:code
+code	segment
+
+; DEFINITION OF VARIABLES USED IN THIS PROGRAM
+;
+
+testmsg    	db      "Interrupt $"	;used only when testing interrupts
+game_over_msg  	db      "Game Over $"	;used only for testing
+
+
+timer_counter	db	0h		;used to pace interrupt timing
+timer_pace	db	01h		;used to pace interrupt timing
+
+next_piece	db	06h		;used to choose next new piece to put into play
+					;initialized to its max value so cycle starts at zero
+ 					;also used as an index when it is time to rotate a piece
+					;the order goes according to piece definitions below
+					;0 = line, 1 = _l, 2 = _r, 3 = _s, 4 = _z and so on up to 6
+
+curr_direction	db	0h		;keep track of orientation so piece can be rotated counter clockwise
+					;0 = right, 1=up, 2=left, 3=down
+					;4 rotations is back to the initial orientation (right)
+
+piece_in_play	db	0h		;variable to control when to put the next piece into play
+
+current_row 	db	0h		;variable used when clearing filled rows
+
+test_counter	db	0h		;used only while testing the program
+
+test_row_c	db	5		;used only for testing
+test_col_c	db	15		;used only for testing
+
+game_score	dw	0h		;value for game score
+
+;this block of piece variables must be kept as-is so they are contained
+;contiguously in memory. the program relies on this
+
+piecex_line     db      5,5,5,5		;initial definition and location of the game pieces
+piecey_line     db      1,2,3,4		;x = inital column locations
+piecex_l        db      5,6,7,5		;y = inital row locations
+piecey_l        db      1,1,1,2
+piecex_r        db      5,6,7,7
+piecey_r        db      1,1,1,2
+piecex_s        db      5,6,6,7
+piecey_s        db      2,2,1,1
+piecex_z        db      5,6,6,7
+piecey_z        db      1,1,2,2
+piecex_t        db      5,6,7,6
+piecey_t        db      1,1,1,2
+piecex_box      db      5,6,5,6
+piecey_box      db      1,1,2,2
+
+;these current piece variables must be kept contiguous in memory
+
+currentpiecex   db      0,0,0,0		;variable used to hold current piece in play
+currentpiecey   db      0,0,0,0
+
+exit_program	db	0h		;variable to control exiting game, 0=no, 1=yes
+
+rotatedpiecex	db	0,0,0,0		;used to hold new pixel definitions when a piece is rotated
+rotatedpiecey	db	0,0,0,0
+
+
+;************************************************
+; OVERALL PROGRAM STARTS HERE
+;
+start:
+	mov	ax,1234h
+	mov	ax,code
+	mov	ds, ax
+
+	call	init_timer_variables	;init counter from pace starting value
+	call	init_screen		;initialize screen to blanks
+	call	draw_border		;draw the game border
+
+;test code start
+
+	call	print_curr_info_title	;track current info on the game board
+
+
+;	call	test_code_for_pick_next_piece
+
+;	call	test_code_for_can_piece_go_into_play
+
+;	call	test_code_for_move_one_row_down
+
+;test code just to move first piece down 1 row until it hits bottom, then game stops
+;  need to comment another piece of code below to get this to work correctly
+;	call	pick_next_piece
+;	call	setpiece
+;	call	show_current_piece
+
+;	jmp	quit
+
+;test code end
+
+
+;************************************************
+; setup interrupt for Keyboard handling
+;	interrupt 9 = onKeyPress
+;
+	push    ds    				;save my ds
+						;set ds to interrupt table
+   	mov    ax,0
+  	mov    ds,ax				;segment 0
+
+						;redirect interrupt 9
+						;put in the entry: onTimer, code segment
+	mov    si,36				;index for interrupt 9
+    	mov    ax,offset onKeyPress
+   	mov    [si],ax
+    	add    si,2
+    	mov    ax,code
+    	mov    [si],ax
+
+	pop    ds				;restore my ds
+
+
+
+;************************************************
+; setup interrupt for timer
+; 	interrupt 8 = onTimer
+
+	push    ds    				;save my ds
+						;set ds to interrupt table
+    	mov    ax,0
+    	mov    ds,ax				;segment 0
+
+						;redirect interrupt 8
+						;put in the entry: onTimer, code segment
+	mov    si,32	    			;32 = int 8 * 4
+    	mov    ax,offset onTimer
+    	mov    [si],ax
+    	add    si,2
+    	mov    ax,code
+    	mov    [si],ax
+
+	pop    ds				;restore my ds
+	cli					;disable interrupts
+
+	mov    al,36h				;set up timer values
+    	out    43h,al
+
+    	mov    al,0ffh
+    	out    40h,al
+    	mov    al,0ffh
+    	out    40h,al
+
+	sti					;now let the interrupts go
+
+;setup infinite loop here - wait on timer expiry
+    
+here:
+	push	si
+	push	ax	
+	mov	si, offset exit_program		;load var that is set by onTimer if it is time to exit
+	mov	al,[si]				;	
+	cmp	al,1				;if var is 1, it is time to exit the program
+	pop	ax
+	pop	si
+	je	quit
+	jmp	here				;otherwise keep looping, timer handler has control
+
+;quit program
+
+quit:
+	call	game_over
+	mov	ax,04C00h				;
+	int	21h	
+
+;**************************************
+; inputs: none
+; outputs: this is the function that handles tasks on timer expiry. most
+;		program execution occurs here.
+
+onTimer:
+
+;first determine if this is a go or skip cycle
+;
+
+	cli
+
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+
+	mov	si, offset timer_counter	;timer counter slows down actions 
+	mov	al,[si]				; only take action every (x) timer cycles
+	cmp	al,0
+	jne	timer_skip_cycle
+
+timer_go_cycle:
+	mov	si, offset timer_pace
+	mov	al,[si]
+	mov	si, offset timer_counter
+	mov	[si],al				;reset timer counter to the pace value
+;	pop	ax
+;	pop	si
+	jmp	timer_game_logic_top		;on a go cycle, jmp to get into the game logic
+
+timer_skip_cycle:
+	mov	si, offset timer_counter	;on a skip cycle, decrement counter and wait
+	mov	al,[si]				;	until next timer expiry
+	sub	al,1
+	mov	si, offset timer_counter
+	mov	[si],al
+;	pop	ax
+;	pop	si
+	jmp	timer_restart
+
+timer_game_logic_top:				;main real time logic for the game starts here
+
+;	call	test_timer			;test code just to see timing is OK
+
+;test code just to move first piece down 1 row until it hits bottom, then game stops
+;requires test code at the top of the program in order to work - both must be uncommented out
+;	call	can_it_move_down
+;	cmp	al,0
+;	jz	timer_game_over
+;
+;	call	move_piece_down_one_row
+
+
+;test code just to output a string
+;	mov	ah,9
+;	mov	dx,offset testmsg
+;	int	21h
+;	jmp	timer_restart
+
+
+
+;FIRST DETERMINE IF A PIECE IS ALREADY IN PLAY
+; IF NOT, PICK A NEW PIECE AND PUT IT INTO PLAY, IF POSSIBLE
+; IF SO, SEE IF IT CAN MOVE
+;
+timer_piece_start:
+	mov	si,offset piece_in_play
+	mov	al,[si]				;see if a game piece is already in play
+	cmp	al,0
+	jne	timer_piece_in_play		;piece already in play, continue
+	mov	si,offset piece_in_play
+	mov	al,1
+	mov	[si],al				;piece is now in play (or game is over)
+	call	pick_next_piece			;si now points to a piece to put into play
+	call	can_piece_go_into_play		;see if the selected piece can be put into play
+	cmp	al,0				;	if not, game is over
+	jz	timer_game_over		;
+	call	setpiece			;else - copy picked piece into current piece 
+	call	show_current_piece		;put piece in start position
+;	call	increment_score			;
+	jmp	timer_restart			;wait for next go cycle
+
+timer_piece_in_play:				;there is a current piece in play
+	call	can_it_move_down
+	cmp	al,0
+	jz	timer_piece_test1
+	call	move_piece_down_one_row
+	jmp	timer_restart
+
+timer_piece_test1:
+	call	check_for_full_rows		;current piece in play can no longer move - cleanup full rows
+	mov	si,offset piece_in_play
+	mov	al,0
+	mov	[si],al				;reset piece_in_play - pick new piece
+	jmp	timer_piece_start
+
+timer_restart:
+	mov	al,20h
+	out	20h,al    			;reset timer and go again
+	jmp	timer_function_exit
+
+timer_game_over:
+;	mov	al,10
+;	mov	ah,23
+;	mov	bl,7
+;	mov	bh,'4'				;MARKER 4
+;	call	setpixel
+
+	mov	si,offset exit_program
+	mov	al,1
+	mov	[si],al
+
+;test code
+;	mov	ah,9				;
+;	mov	dx,offset game_over_msg		;reference to message to write
+;	int	21h				;write message to console
+
+timer_function_exit:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	sti					;enable interrupts and return
+	iret
+
+;*****************************************
+; inputs: current piece in play, keyboard buffer
+; outputs: current piece is moved, if possible, based on keyboard input
+;
+
+onKeyPress:
+
+	cli					;disable interrupts while we are processing
+
+	push	ax
+	push	bx
+	push	es
+	push	si
+	push	ds
+
+;	mov	al,10
+;	mov	ah,26
+;	mov	bl,7
+;	mov	bh,'7'				;MARKER 7
+;	call	setpixel
+
+onKeyPress_1:
+	in	al,64h				;read keyboard controller status byte
+	and	al,01b				;see if there are any chars
+	jz	onKeyPress_1			;keep looping until there is one
+
+	in	al,60h				;read the char from the keyboard
+
+;	push	ax				;save the character
+
+;	mov	al,0f4h				;0f4 is the reset command
+;	out	64h,al				;send reset command to the keyboard
+;onKeyPress_2:
+;	in	al,64h				;read keyboard control byte
+;	and	al,01b				;expecting a zero here - wait for it
+;	jnz	onKeyPress_2
+
+;	mov	al,10
+;	mov	ah,27
+;	mov	bl,7
+;	mov	bh,'8'				;MARKER 8
+;	call	setpixel
+
+;	pop	ax				;restore char that was read in
+
+	cmp	al,04bh				;is the char a left arrow
+	jnz	onKeyPress_3
+	call	move_left_if_possible		;move left if so
+	jmp	onKeyPress_cleanup
+
+onKeyPress_3:
+	cmp	al,04dh				;is the char a right arrow
+	jnz	onKeyPress_4		;
+	call	move_right_if_possible		;move right if so
+	jmp	onKeyPress_cleanup
+
+onKeyPress_4:
+	cmp	al,050h				;is the char a down arrow
+	jnz	onKeyPress_5
+
+	call	can_it_move_down		;move the curr piece 1 down, if possible
+	cmp	al,0
+	jz	onKeyPress_cleanup
+	call	move_piece_down_one_row
+	jmp	onKeyPress_cleanup
+
+onKeyPress_5:
+	cmp	al,048h				;is the char an up arrow
+	jnz	onKeyPress_cleanup		;finally, the char is unrecognized, ignore it
+	call	rotate_piece			;rotate the current piece counter clockwise
+
+onKeyPress_cleanup:
+	in	al,64h				;read keyboard controller status byte
+	and	al,01b				;see if there are any chars
+	jz	onKeyPress_end			;exit if not
+
+	in	al,60h				;read the char from the keyboard
+	jmp	onKeyPress_cleanup		;keep looping until empty
+
+onKeyPress_end:
+	push	si				;test code
+	call	print_current_info		;test code
+	pop	si				;test code
+
+	mov	al,20h
+	out	20h,al    			;reset and go again
+
+	pop	ds
+	pop	si
+	pop	es
+	pop	bx
+	pop	ax
+	sti					;enable interrupts again
+	iret
+
+;*****************************************
+
+test_timer:
+
+	push	bx
+	push	dx
+	push	si
+	push	ax
+
+	mov	bl,7
+	mov	bh,'+'
+
+	mov	si,offset test_col_c
+	mov	dl,[si]
+	cmp	dl,40
+	jne	test_timer_1
+	mov	dl,15
+	mov	si,offset test_col_c
+	mov	[si],dl
+	
+test_timer_1:	
+	mov	si,offset test_row_c
+	mov	al,[si]
+
+	mov	si,offset test_col_c
+	mov	dl,[si]
+	mov	ah,dl
+	add	dl,1
+	mov	si,offset test_col_c
+	mov	[si],dl
+
+	call	setpixel
+	
+test_timer_done:
+	pop	ax
+	pop	si
+	pop	dx
+	pop	bx
+	ret
+
+;*****************************************
+; INITIALIZE THE SCREEN TO ALL BLANKS
+; INITIALIZES THE WHOLE SCREEN, NOT JUST THE GAME BOARD
+
+init_screen:
+	push	ax
+	push	bx
+
+	mov	al,0			;init parameters for setpixel
+	mov	bl,0			;start in row 0, column 0
+	mov	bh,''
+
+init_s_row_loop:
+	cmp	al,25			;do all columns in 1 row first
+	jz	init_s_exit		;   then go to the next row
+	mov	ah,0
+
+init_s_column_loop:
+	cmp	ah,80			;loop on column
+	jz	init_s_nextrow
+	call	setpixel
+	add	ah,1
+	jmp	init_s_column_loop
+
+init_s_nextrow:
+	add	al,1			;incr to next row and loop
+	jmp	init_s_row_loop
+
+init_s_exit:
+	pop	bx
+	pop	ax
+	ret
+
+;*****************************************
+; DRAW THE GAME BORDER. THIS IS A PERMANENT BORDER.
+
+draw_border:
+	push	ax		
+	push	bx
+
+	mov	al,1		;init parameters for setpixel	
+	mov	ah,0		;  starting with row 1, column 0
+	mov	bl,7		;  row 0 is left blank intentionally
+	mov	bh,'|'
+
+db_left_loop:
+	cmp	al,21		;loop to draw left side border
+	jz	db_next_1
+	call	setpixel
+	add	al,1
+	jmp	db_left_loop
+
+db_next_1:
+	mov	al,1		;init parameters to draw right side border
+	mov	ah,11
+
+db_right_loop:
+	cmp	al,21		;loop to draw right side border
+	jz	db_next_2
+	call	setpixel
+	add	al,1
+	jmp	db_right_loop
+
+db_next_2:
+	mov	al,21		;init parameters to draw bottom border
+	mov	ah,0
+	mov	bh,'_'
+
+db_bottom_loop:
+	cmp	ah,12		;loop to draw bottom border
+	jz	db_exit
+	call	setpixel
+	add	ah,1
+	jmp	db_bottom_loop
+
+db_exit:
+	pop	bx
+	pop	ax
+	ret
+
+;*****************************************
+;inputs:
+; AL = row identifier
+; AH = column identifier
+; BL = color identifier, 0=black, 7=white
+; BH = character to be written to video memory
+;output: sets the input character with input color to the input screen position
+
+setpixel:
+	push	ds	;save ds
+	push	si	;save si
+	push	ax	;save ax
+	push	bx	;save bx
+	push	dx	;save dx
+	mov	dx,160	;set dx to 160
+	push	ax	;save ax
+	mov	ah,0	;set ah to 0
+	mul	dx	;multiplies al by dx(160)
+	mov	dx,ax	;put answer from above into dx
+	pop	ax	;bring ax back
+	mov	al,ah	;put ah into al
+	mov	ah,0	;set ah to 0
+	add	al,al	;add al and al
+	add	ax,dx	;add ax and dx	final addition to get address
+	mov	si,ax	;set si to ax
+	cmp	bl,0	;if bl is off,
+	jz	dontchange	;go to dontchange loop
+	mov	bl,7	;if bl is on, change color to white
+
+dontchange:
+	mov	ax,0b800h	;put address of first block into ax
+	mov	ds,ax		;set address to ax
+	mov	[si],bh		;put * into the address space that we've put into si
+	add	si,1		;MAKE IT PRETTY and functional
+	mov	[si],bl		;move address to bl
+	pop	dx		;bring back dx
+	pop	bx		;bring back bx
+	pop	ax		;bring back ax
+	pop	si		;bring back si
+	pop	ds		;bring back ds
+	ret			;return
+
+;*****************************************
+;inputs:
+;	AL = row
+;	AH = column
+;	BL = color
+;output:
+;	does the setpixel function with the character hard-coded to asterisk
+;
+
+setpixel_ast:
+	push	bx
+	mov	bh,'*'
+	call	setpixel
+	pop	bx
+	ret
+
+;*****************************************
+;inputs:
+;	AL = row
+;	AH = column
+;output:
+;	returns BL = current color of the input pixel
+
+getpixel:
+	push	ds	;save ds
+	push	si	;save si
+	push	ax	;save ax
+	push	dx	;save dx
+	mov	dx,160	
+	push	ax
+	mov	ah,0
+	mul	dx
+	mov	dx,ax
+	pop	ax
+	mov	al,ah
+	mov	ah,0
+	add	al,al
+	add	ax,dx
+	mov	si,ax
+	add	si,1
+	mov	ax, 0b800h
+	mov	ds,ax
+	mov	bl,[si]
+	pop	dx
+	pop	ax
+	pop	si
+	pop	ds
+	ret
+
+;*******************************************
+;inputs: 
+;	si = address of piece to be set as the current piece
+;output: 
+;	current piece variable is initialized to the input piece
+
+setpiece:
+	push	si
+	push	ax
+	push	bx
+	
+	mov	al,0		;init counter to zero
+	mov	bx,0
+
+setpiece_loop1:
+	cmp	al,8		;done if al = 8
+	je	setpiece_next1
+	mov	bl,[si]
+	push	bx
+	add	al,1
+	add	si,1
+	jmp	setpiece_loop1	;
+
+setpiece_next1:
+	mov	al,0
+	mov	si, offset currentpiecex
+	add	si,7
+
+setpiece_loop2:	
+	cmp	al,8
+	je	setpiece_done
+	pop	bx
+	mov	[si],bl
+	sub	si,1
+	add	al,1
+	jmp	setpiece_loop2
+
+setpiece_done:
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+;*********************************************
+; inputs: current piece
+; outputs: current piece is moved 1 column to the right, if possible
+
+
+move_right_if_possible:
+
+	push	bx
+	push	dx
+	call	hide_current_piece		;must hide current piece first
+						; so that current piece pixels do not
+						; generate a false negative 
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	dl,0				;init counter
+	
+move_right_if_possible_loop:
+	cmp	dl,4
+	je	move_right_if_possible_yes	;if all coordinates are checked, it can move
+	mov	ah,[si]				;get column
+	mov	al,[si+4]			;get row
+	add	ah,1				;add 1 to the column, to look 1 column right
+	call	getpixel			;get the color 
+	cmp	bl,0				;if not black, we are done
+	jne	move_right_if_possible_exit
+	add	si,1				;point to the next coordinate
+	add	dl,1				;
+	jmp	move_right_if_possible_loop	;keep checking
+
+move_right_if_possible_yes:
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	al,[si]				;get 1st column value
+	add	al,1				;change it to 1 column to the right
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	[si],al
+	
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	al,[si+1]			;get 2nd column value
+	add	al,1				;change it to 1 column to the right
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	[si+1],al
+	
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	al,[si+2]			;get 3rd column value
+	add	al,1				;change it to 1 column to the right
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	[si+2],al
+	
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	al,[si+3]			;get 4th column value
+	add	al,1				;change it to 1 column to the right
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	[si+3],al
+	
+
+move_right_if_possible_exit:
+	call	show_current_piece		;restore current piece on the screen
+	pop	dx
+	pop	bx
+	ret
+
+
+
+;*********************************************
+; inputs: current piece
+; outputs: current piece is moved 1 column to the left, if possible
+
+
+move_left_if_possible:
+
+	push	bx
+	push	dx
+	call	hide_current_piece		;must hide current piece first
+						; so that current piece pixels do not
+						; generate a false negative 
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	dl,0				;init counter
+	
+move_left_if_possible_loop:
+	cmp	dl,4
+	je	move_left_if_possible_yes	;if all coordinates are checked, it can move
+	mov	ah,[si]				;get column
+	mov	al,[si+4]			;get row
+	sub	ah,1				;subtract 1 from the column, to look 1 column left
+	call	getpixel			;get the color 
+	cmp	bl,0				;if not black, we are done
+	jne	move_left_if_possible_exit
+	add	si,1				;point to the next coordinate
+	add	dl,1				;
+	jmp	move_left_if_possible_loop	;keep checking
+
+move_left_if_possible_yes:
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	al,[si]				;get 1st column value
+	sub	al,1				;change it to 1 column to the left
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	[si],al
+	
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	al,[si+1]			;get 2nd column value
+	sub	al,1				;change it to 1 column to the left
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	[si+1],al
+	
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	al,[si+2]			;get 3rd column value
+	sub	al,1				;change it to 1 column to the left
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	[si+2],al
+	
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	al,[si+3]			;get 4th column value
+	sub	al,1				;change it to 1 column to the left
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	[si+3],al
+	
+
+move_left_if_possible_exit:
+	call	show_current_piece		;restore current piece on the screen
+	pop	dx
+	pop	bx
+	ret
+
+;*********************************************
+;inputs: currentpiecex and y must have data for piece
+;output: AL register. 0 = cannot move, 1 = OK to move down 1 row
+
+can_it_move_down:
+	push	bx
+	push	dx
+	call	hide_current_piece		;must hide current piece first
+						; so that current piece pixels do not
+						; generate a false negative 
+	mov	si,offset currentpiecex		;get base addr of current piece
+	mov	dl,0				;init counter
+	
+can_it_move_loop:
+	cmp	dl,4
+	je	can_it_move_yes			;if all coordinates are checked, it can move
+	mov	ah,[si]				;get column
+	mov	al,[si+4]			;get row
+	add	al,1				;add 1 to the row, to look 1 row down
+	call	getpixel			;get the color 1 row down
+	cmp	bl,0				;if not black, we are done
+	jne	can_it_move_no
+	add	si,1				;point to the next coordinate
+	add	dl,1				;
+	jmp	can_it_move_loop		;keep checking
+
+can_it_move_no:
+;	mov	al,10
+;	mov	ah,25
+;	mov	bl,7
+;	mov	bh,'6'				;MARKER 6
+;	call	setpixel
+
+	mov	al,0				;set return result = no
+	jmp	can_it_move_exit	
+
+can_it_move_yes:
+	mov	al,1				;set return result = OK to move down 1 row
+
+can_it_move_exit:
+	call	show_current_piece		;restore current piece on the screen
+	pop	dx
+	pop	bx
+	ret
+
+;**********************************************
+;inputs: currentpiecex and y must have data for piece to show
+;output: make current piece appear on video display
+
+show_current_piece:
+	push	ax
+	push	bx
+	push	dx
+	mov	bl,7				;set color - white
+	mov	si, offset currentpiecex	;get base addr of curr piece
+	mov	dl,0				;loop counter
+
+show_current_piece_loop:
+	cmp	dl,4
+	je	show_current_piece_stop
+	add	dl,1
+	mov	al,[si+4]			;gets row coordinate
+	mov	ah,[si]				;gets column coordinate
+	call	setpixel_ast			;set the pixel to asterisk
+	add	si,1				;setup for next coordinate
+	jmp	show_current_piece_loop
+
+show_current_piece_stop:
+	pop	dx
+	pop	bx
+	pop	ax
+	ret
+
+;************************************************
+;inputs: currentpiecex and y must have data for piece to show
+;output: make current piece disappear from video display
+
+hide_current_piece:
+	push	ax
+	push	bx
+	push	dx
+	mov	bl,0				;set color - black
+	mov	si, offset currentpiecex	;get base addr of curr piece
+	mov	dl,0				;loop counter
+
+hide_current_piece_loop:
+	cmp	dl,4
+	je	hide_current_piece_stop
+	add	dl,1
+	mov	al,[si+4]			;gets row coordinate
+	mov	ah,[si]				;gets column coordinate
+	call	setpixel_ast			;set the pixel to black
+	add	si,1				;setup for next coordinate
+	jmp	hide_current_piece_loop
+
+hide_current_piece_stop:
+	pop	dx
+	pop	bx
+	pop	ax
+	ret
+
+;**************************************************
+;INPUTS: none
+;OUTPUTS: set initial value for timing pace counter
+
+init_timer_variables:
+	push	si
+	push	ax
+	mov	si, offset timer_pace		;read starting value for pace counter
+	mov	al,[si]
+	mov	si, offset timer_counter	;put that value in the working counter
+	mov	[si],al
+	pop	ax
+	pop	si
+	ret
+
+;***************************************************
+;inputs: next_piece variable is used
+;
+;output: si = addr of next piece to put into play
+;	sets curr_direction to right
+
+pick_next_piece:
+	push	ax
+
+	mov	si,offset curr_direction	;reset direction to right
+	mov	al,0
+	mov	[si],al
+
+	mov	si,offset next_piece		;read tracking variable
+	mov	al,[si]				;get ID for last piece that was picked
+	cmp	al,06h				;check if max value
+	je	pick_next_piece1
+	add	al,1				;if not, incr variable
+	jmp	pick_next_piece2
+
+pick_next_piece1:
+	mov	al,0				;reset back to beginning of cycle
+
+pick_next_piece2:
+	mov	si,offset next_piece
+	mov	[si],al				;save the updated variable
+
+	mov	si,offset piecex_line		;init to first piece in list
+	cmp	al,0
+	jne	pick_next_piece3
+	jmp	pick_next_exit
+
+pick_next_piece3:
+	add	si,8				;point to next piece
+	cmp	al,01h
+	jne	pick_next_piece4
+	jmp	pick_next_exit
+	
+pick_next_piece4:
+	add	si,8				;point to next piece
+	cmp	al,02h
+	jne	pick_next_piece5
+	jmp	pick_next_exit
+	
+pick_next_piece5:
+	add	si,8				;point to next piece
+	cmp	al,03h
+	jne	pick_next_piece6
+	jmp	pick_next_exit
+	
+pick_next_piece6:
+	add	si,8				;point to next piece
+	cmp	al,04h
+	jne	pick_next_piece7
+	jmp	pick_next_exit
+	
+pick_next_piece7:
+	add	si,8				;point to next piece
+	cmp	al,05h
+	jne	pick_next_piece8
+	jmp	pick_next_exit
+	
+pick_next_piece8:
+	add	si,8				;point to next piece
+
+pick_next_exit:
+	push	si				;test code
+	call	print_current_info		;test code
+	pop	si				;test code
+		
+	pop	ax
+	ret
+
+;***************************************************
+;inputs: current piece has already passed check for can it move down
+;
+;output:  
+;current piece is moved down 1 row
+
+move_piece_down_one_row:
+	push	si
+	push	dx
+
+	call	hide_current_piece		;hide piece in its current position
+
+;	mov	dl,0h				;init counter variable
+	mov	si,offset currentpiecey		;init pointer to current piece
+
+;move_piece_down_one_row_loop:
+;	cmp	dl,1				;see if all 4 pixels have been processed
+;	je	move_piece_down_one_row_done	;jmp if so
+;	mov	al,[si]				;get row ID of pixel
+;	add	al,1				;increment row by 1
+;	mov	[si],al				;write back to pixel
+;	add	dl,1				;increment counter
+;	add	si,1				;point to next pixel
+;	jmp	move_piece_down_one_row_loop	;keep checking
+
+	mov	al,[si]
+	add	al,1
+	mov	si,offset currentpiecey		;init pointer to current piece
+	mov	[si],al
+
+	mov	al,[si+1]
+	add	al,1
+	mov	si,offset currentpiecey		;init pointer to current piece
+	mov	[si+1],al
+
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset currentpiecey		;init pointer to current piece
+	mov	[si+2],al
+
+	mov	al,[si+3]
+	add	al,1
+	mov	si,offset currentpiecey		;init pointer to current piece
+	mov	[si+3],al
+
+move_piece_down_one_row_done:
+	call	show_current_piece		;show the piece in its new position
+	pop	dx
+	pop	si
+	ret
+
+
+;***************************************************
+;inputs: si points to piece that is supposed to go into play.
+; determine if any pixels are already occupied for this piece
+;
+;output: al = 0 = piece cannot go into play, 
+;al = 1 = OK to put piece into play
+
+can_piece_go_into_play:
+
+	push	si
+	push	dx
+
+	mov	dl,0h				;init counter variable
+
+can_piece_go_into_play_loop:
+	cmp	dl,4				;see if all 4 pixels have been checked
+	je	can_piece_go_into_play_yes	;jmp if so
+	mov	al,[si+4]			;get row ID of first pixel
+	mov	ah,[si]				;get column ID of first pixel
+	call	getpixel			;get current color of pixel
+	cmp	bl,0				;0 = black = vacant, 7 = white = occupied
+	jnz	can_piece_go_into_play_no	;jmp if not vacant
+	add	si,1				;point to next pixel
+	add	dl,1				;incr loop counter
+	jmp	can_piece_go_into_play_loop	;keep checking
+
+can_piece_go_into_play_yes:
+	mov	al,1				;set return result = 1 (OK) and exit
+	jmp	can_piece_go_into_play_exit
+
+can_piece_go_into_play_no:
+	mov	al,0				;set return result = 0 (not OK) and exit
+
+can_piece_go_into_play_exit:
+	pop	dx
+	pop	si
+	ret
+
+;**********************************************
+; PRINT THE CURRENT PIECE INFO ON THE GAME BOARD
+; USED FOR TESTING PURPOSES
+
+print_current_info:
+	push	ax
+	push	bx
+	push	si
+
+	mov	si,offset curr_direction	;get the current direction variable
+	mov	al,[si]
+	cmp	al,0
+	jnz	print_current_info_1
+	mov	al,5
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'0'				
+	call	setpixel
+	jmp	print_current_info_6
+
+print_current_info_1:
+	cmp	al,1
+	jnz	print_current_info_2
+	mov	al,5
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'1'				
+	call	setpixel
+	jmp	print_current_info_6
+
+print_current_info_2:
+	cmp	al,2
+	jnz	print_current_info_4
+	mov	al,5
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'2'				
+	call	setpixel
+	jmp	print_current_info_6
+
+print_current_info_4:
+	cmp	al,3
+	jnz	print_current_info_5
+	mov	al,5
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'3'				
+	call	setpixel
+	jmp	print_current_info_6
+
+print_current_info_5:				;should not get here - invalid value
+	mov	al,5
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'!'				
+	call	setpixel
+
+print_current_info_6:
+	mov	si,offset next_piece		;get current next piece index
+	mov	al,[si]
+	cmp	al,0
+	jnz	print_current_info_7
+	mov	al,7
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'0'				
+	call	setpixel
+	jmp	print_current_info_end
+
+print_current_info_7:
+	cmp	al,1
+	jnz	print_current_info_8
+	mov	al,7
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'1'				
+	call	setpixel
+	jmp	print_current_info_end
+
+print_current_info_8:
+	cmp	al,2
+	jnz	print_current_info_9
+	mov	al,7
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'2'				
+	call	setpixel
+	jmp	print_current_info_end
+
+print_current_info_9:
+	cmp	al,3
+	jnz	print_current_info_10
+	mov	al,7
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'3'				
+	call	setpixel
+	jmp	print_current_info_end
+
+print_current_info_10:
+	cmp	al,4
+	jnz	print_current_info_11
+	mov	al,7
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'4'				
+	call	setpixel
+	jmp	print_current_info_end
+
+print_current_info_11:
+	cmp	al,5
+	jnz	print_current_info_12
+	mov	al,7
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'5'				
+	call	setpixel
+	jmp	print_current_info_end
+
+print_current_info_12:
+	cmp	al,6
+	jnz	print_current_info_13
+	mov	al,7
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'6'				
+	call	setpixel
+	jmp	print_current_info_end
+
+print_current_info_13:					;should not get here - invalid value
+	mov	al,7
+	mov	ah,30
+	mov	bl,7
+	mov	bh,'!'				
+	call	setpixel
+
+print_current_info_end:
+	pop	si
+	pop	bx
+	pop	ax
+	ret
+
+;**********************************************
+test_code_for_move_one_row_down:
+
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece
+
+	mov	ax,0ffffh
+btest1:	sub	ax,1
+	jnz	btest1
+
+	call	hide_current_Piece
+	call	pick_next_piece
+	call	can_piece_go_into_play
+	cmp	al,0
+	jz	btest4
+	mov	al,10
+	mov	ah,20
+	mov	bl,7
+	mov	bh,'Y'
+	call	setpixel
+
+	call	move_piece_down_one_row
+
+btest2:
+	mov	ax,0ffffh
+btest3:	sub	ax,1
+	jnz	btest3
+
+	call	can_it_move_down
+	cmp	al,0
+	jz	btest99
+
+	call	move_piece_down_one_row
+	jmp	btest2
+
+	jmp	btest99
+
+btest4:
+	mov	al,10
+	mov	ah,20
+	mov	bl,7
+	mov	bh,'N'
+	call	setpixel
+
+btest99:
+	ret
+
+
+
+;**********************************************
+test_code_for_can_piece_go_into_play:
+
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece
+
+	mov	ax,0ffffh
+atest1:	sub	ax,1
+	jnz	atest1
+
+;	call	hide_current_Piece
+	call	pick_next_piece
+	call	can_piece_go_into_play
+	cmp	al,0
+	jz	atest2
+	mov	al,10
+	mov	ah,20
+	mov	bl,7
+	mov	bh,'Y'
+	call	setpixel
+	jmp	atest99
+
+atest2:
+	mov	al,10
+	mov	ah,20
+	mov	bl,7
+	mov	bh,'N'
+	call	setpixel
+
+atest99:
+	ret
+
+
+;**********************************************
+test_code_for_pick_next_piece:
+
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece
+
+	mov	ax,0ffffh
+test1:	sub	ax,1
+	jnz	test1
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test2:	sub	ax,1
+	jnz	test2
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test3:	sub	ax,1
+	jnz	test3
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test4:	sub	ax,1
+	jnz	test4
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test5:	sub	ax,1
+	jnz	test5
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+		
+	mov	ax,0ffffh
+test6:	sub	ax,1
+	jnz	test6
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	call	move_piece_down_one_row
+	call	move_piece_down_one_row
+	call	move_piece_down_one_row
+	call	move_piece_down_one_row
+	
+	mov	ax,0ffffh
+test7:	sub	ax,1
+	jnz	test7
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test8:	sub	ax,1
+	jnz	test8
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test9:	sub	ax,1
+	jnz	test9
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test10:	sub	ax,1
+	jnz	test10
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test11:	sub	ax,1
+	jnz	test11
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test12:	sub	ax,1
+	jnz	test12
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test13:	sub	ax,1
+	jnz	test13
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test14:	sub	ax,1
+	jnz	test14
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test15:	sub	ax,1
+	jnz	test15
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test16:	sub	ax,1
+	jnz	test16
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test17:	sub	ax,1
+	jnz	test17
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test18:	sub	ax,1
+	jnz	test18
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test19:	sub	ax,1
+	jnz	test19
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test20:	sub	ax,1
+	jnz	test20
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test21:	sub	ax,1
+	jnz	test21
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test22:	sub	ax,1
+	jnz	test22
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test23:	sub	ax,1
+	jnz	test23
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test24:	sub	ax,1
+	jnz	test24
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test25:	sub	ax,1
+	jnz	test25
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test26:	sub	ax,1
+	jnz	test26
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test27:	sub	ax,1
+	jnz	test27
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test28:	sub	ax,1
+	jnz	test28
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	mov	ax,0ffffh
+test29:	sub	ax,1
+	jnz	test29
+
+	call	hide_current_piece
+	call	pick_next_piece
+	call	setpiece
+	call	show_current_piece	
+	
+	ret
+
+;**********************************************
+; PUBLISH THE CURRENT PIECE INFO ON THE GAME BOARD
+; used for testing purposes
+
+print_curr_info_title:
+
+;print the word direction
+
+	mov	al,5
+	mov	ah,20
+	mov	bl,7
+	mov	bh,'D'				
+	call	setpixel
+	mov	al,5
+	mov	ah,21
+	mov	bl,7
+	mov	bh,'I'				
+	call	setpixel
+	mov	al,5
+	mov	ah,22
+	mov	bl,7
+	mov	bh,'R'				
+	call	setpixel
+	mov	al,5
+	mov	ah,23
+	mov	bl,7
+	mov	bh,'E'				
+	call	setpixel
+	mov	al,5
+	mov	ah,24
+	mov	bl,7
+	mov	bh,'C'				
+	call	setpixel
+	mov	al,5
+	mov	ah,25
+	mov	bl,7
+	mov	bh,'T'				
+	call	setpixel
+	mov	al,5
+	mov	ah,26
+	mov	bl,7
+	mov	bh,'I'				
+	call	setpixel
+	mov	al,5
+	mov	ah,27
+	mov	bl,7
+	mov	bh,'O'				
+	call	setpixel
+	mov	al,5
+	mov	ah,28
+	mov	bl,7
+	mov	bh,'N'				
+	call	setpixel
+	mov	al,5
+	mov	ah,29
+	mov	bl,7
+	mov	bh,'-'				
+	call	setpixel
+	mov	al,5
+	mov	ah,29
+	mov	bl,7
+	mov	bh,' '				
+	call	setpixel
+
+;print the word piece
+
+	mov	al,7
+	mov	ah,24
+	mov	bl,7
+	mov	bh,'P'				
+	call	setpixel
+	mov	al,7
+	mov	ah,25
+	mov	bl,7
+	mov	bh,'I'				
+	call	setpixel
+	mov	al,7
+	mov	ah,26
+	mov	bl,7
+	mov	bh,'E'				
+	call	setpixel
+	mov	al,7
+	mov	ah,27
+	mov	bl,7
+	mov	bh,'C'				
+	call	setpixel
+	mov	al,7
+	mov	ah,28
+	mov	bl,7
+	mov	bh,'E'				
+	call	setpixel
+	mov	al,7
+	mov	ah,29
+	mov	bl,7
+	mov	bh,'-'				
+	call	setpixel
+	mov	al,7
+	mov	ah,29
+	mov	bl,7
+	mov	bh,' '				
+	call	setpixel
+	ret
+
+
+;**********************************************
+; PRINTS THE TEXT GAME OVER ON THE GAME BOARD.
+
+game_over:
+
+	mov	al,21
+	mov	ah,20
+	mov	bl,7
+	mov	bh,'G'				
+	call	setpixel
+	mov	al,21
+	mov	ah,21
+	mov	bl,7
+	mov	bh,'A'				
+	call	setpixel
+	mov	al,21
+	mov	ah,22
+	mov	bl,7
+	mov	bh,'M'				
+	call	setpixel
+	mov	al,21
+	mov	ah,23
+	mov	bl,7
+	mov	bh,'E'				
+	call	setpixel
+	mov	al,21
+	mov	ah,24
+	mov	bl,7
+	mov	bh,' '				
+	call	setpixel
+	mov	al,21
+	mov	ah,25
+	mov	bl,7
+	mov	bh,'O'				
+	call	setpixel
+	mov	al,21
+	mov	ah,26
+	mov	bl,7
+	mov	bh,'V'				
+	call	setpixel
+	mov	al,21
+	mov	ah,27
+	mov	bl,7
+	mov	bh,'E'				
+	call	setpixel
+	mov	al,21
+	mov	ah,28
+	mov	bl,7
+	mov	bh,'R'				
+	call	setpixel
+	mov	al,21
+	mov	ah,29
+	mov	bl,7
+	mov	bh,'!'				
+	call	setpixel
+	ret
+
+;**********************************************
+; DETERMINES IF THE CURRENT PIECE CAN BE ROTATED ONE STEP IN A COUNTER CLOCKWISE DIRECTION
+; CONVENTIONS: STARTING POSITION FOR ALL PIECES IS "RIGHT" (EVEN FOR THE LINE).
+; ONE KEY PRESS OF UP ARROW GOES TO THE "UP" POSITION. NEXT IS LEFT, NEXT IS DOWN, NEXT IS BACK TO RIGHT
+
+rotate_piece:
+
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	si,offset next_piece			;get the address of next_piece
+	mov	al,[si]					;get value of next piece
+	cmp	al,0					;check if the curr piece is the line
+	jnz	rp1					;jmp if not
+	call	rotate_piece_line			;call the function to rotate the line
+	jmp	rp_end
+rp1:
+	cmp	al,1					;is curr piece = piece_L
+	jnz	rp2					;jmp if not
+	call	rotate_piece_l
+	jmp	rp_end
+rp2:
+	cmp	al,2					;is it piece_r
+	jnz	rp3
+	call	rotate_piece_r				;rotate piece_r
+	jmp	rp_end
+rp3:
+	cmp	al,3					;is it piece_s
+	jnz	rp4
+	call	rotate_piece_s
+	jmp	rp_end
+rp4:
+	cmp	al,4					;is it piece_z
+	jnz	rp5					;
+	call	rotate_piece_z
+	jmp	rp_end
+rp5:
+	cmp	al,5					;is it piece_t
+	jnz	rp_end					;if not piece_t, goto end because the last piece - the box - does not rotate
+	call	rotate_piece_t
+	jmp	rp_end
+rp_end:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+
+
+;**********************************************
+
+copy_currentpiece_to_rotatedpiece:
+
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	dl,0
+	mov	bx,0
+
+copy_curr_loop1:
+	cmp	dl,8
+	jz	copy_curr_end
+	mov	si,offset currentpiecex
+	add	si,bx
+	mov	al,[si]
+	mov	si,offset rotatedpiecex
+	add	si,bx
+	mov	[si],al
+	add	bx,1
+	add	dl,1
+	jmp	copy_curr_loop1
+
+copy_curr_end:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+
+;**********************************************
+
+copy_rotatedpiece_to_currentpiece:
+
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	dl,0
+	mov	bx,0
+
+copy_rotated_loop1:
+	cmp	dl,8
+	jz	copy_rotated_end
+	mov	si,offset rotatedpiecex
+	add	si,bx
+	mov	al,[si]
+	mov	si,offset currentpiecex
+	add	si,bx
+	mov	[si],al
+	add	bx,1
+	add	dl,1
+	jmp	copy_rotated_loop1
+
+copy_rotated_end:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+
+;*********************************************
+;inputs: rotatedpiecex and y must have data for piece
+;output: AL register. 0 = cannot move, 1 = OK to rotate
+
+can_it_rotate:
+	push	bx
+	push	dx
+	call	hide_current_piece
+
+	mov	si,offset rotatedpiecex
+	mov	dl,0
+
+can_it_rotate_loop:
+	cmp	dl,4
+	je	can_it_rotate_yes
+	mov	ah,[si]
+	mov	al,[si+4]
+	call	getpixel
+	cmp	bl,0
+	jne	can_it_rotate_no
+	add	si,1
+	add	dl,1
+	jmp	can_it_rotate_loop
+
+can_it_rotate_no:
+	mov	al,0
+	jmp	can_it_rotate_exit
+
+can_it_rotate_yes:
+	mov	al,1
+
+can_it_rotate_exit:
+	call	show_current_piece
+	pop	dx
+	pop	bx
+	ret
+
+;**********************************************
+rotate_piece_line:
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	al,15
+	mov	ah,20
+	mov	bl,7
+	mov	bh,'0'				
+	call	setpixel
+
+	mov	si,offset curr_direction
+	mov	al,[si]					;read the current orientation of the piece
+							;in case of the line, 0 is the starting orientation. this is a vertical line
+							;	1 is only other valid orientation, for a horizontal line
+	cmp	al,0
+	jz	rpl1
+
+	call	copy_currentpiece_to_rotatedpiece	;copy values for current piece
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	add	al,1
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	sub	al,1
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+3]
+	sub	al,2
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	sub	al,1
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+6]
+	add	al,1
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+7]
+	add	al,2
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+7],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpl_end
+	jz	rpl_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece	;save rotated piece as current piece
+	call	show_current_piece
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpl_end
+
+rpl1:							;current orientation is 0, meaning a vertical line
+	call	copy_currentpiece_to_rotatedpiece	;copy values for current piece
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	sub	al,1
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+3]
+	add	al,2
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	add	al,1
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+6]
+	sub	al,1
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+7]
+	sub	al,2
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	[si+7],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpl_end
+	jz	rpl_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece	;save rotated piece as current piece
+	call	show_current_piece
+
+	mov	al,1
+	mov	si,offset curr_direction
+	mov	[si],al		
+
+rpl_end:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+;**********************************************
+rotate_piece_l:
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	al,15
+	mov	ah,20
+	mov	bl,7
+	mov	bh,'0'				
+	call	setpixel
+
+	mov	si,offset curr_direction
+	mov	al,[si]					;read the current orientation of the piece
+							;in case of the line, 0 is the starting orientation. Down pixel in on the left
+
+	cmp	al,0
+	jz	rpl_1
+
+	cmp	al,1
+	jz	rotatel2
+
+	cmp	al,2
+	jz	rotatel3
+
+	cmp	al,3
+	jz	rotatel4
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpl_end2
+
+rotatel2:
+	jmp	rpl_2
+
+rotatel3:
+	jmp	rpl_3
+
+rotatel4:
+	jmp	rpl_4
+
+rpl_1:
+	call copy_currentpiece_to_rotatedpiece		;copy values for current piece into rotated piece variable
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+3]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+5]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+7]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpl_end2
+	jz	rotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,1
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpl_end2
+
+rotation_denied:
+	jmp	rpl_end2
+
+rpl_2:
+	call copy_currentpiece_to_rotatedpiece		;copy values for current piece into rotated piece variable
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+6]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+7]
+	sub	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpl_end2
+	jz	rotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,2
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpl_end2
+
+rpl_3:
+	call copy_currentpiece_to_rotatedpiece		;copy values for current piece into rotated piece variable
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+3]
+	sub	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+6]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpl_end2
+	jz	rpl_end2
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,3
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpl_end2
+
+rpl_4:
+	call copy_currentpiece_to_rotatedpiece		;copy values for current piece into rotated piece variable
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+6]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+7]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpl_end2
+	jz	rpl_end2
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpl_end2
+
+rpl_end2:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+;**********************************************
+rotate_piece_r:				
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	al,15
+	mov	ah,22
+	mov	bl,7
+	mov	bh,'2'				
+	call	setpixel
+
+	mov	si,offset curr_direction
+	mov	al,[si]					;read the current orientation of the piece
+							;in case of the line, 0 is the starting orientation. Down pixel in on the right
+
+	cmp	al,0
+	jz	rpr_1
+
+	cmp	al,1
+	jz	rotater2
+
+	cmp	al,2
+	jz	rotater3
+
+	cmp	al,3
+	jz	rotater4
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpr_end
+
+rotater2:
+	jmp	rpr_2
+
+rotater3:
+	jmp	rpr_3
+
+rotater4:
+	jmp	rpr_4
+
+rpr_1:
+	call copy_currentpiece_to_rotatedpiece		;copy values for current piece into rotated piece variable
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+5]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+7]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpl_end2
+	jz	right_rotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,1
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpr_end
+
+right_rotation_denied:
+	jmp	rpr_end
+
+rpr_2:
+	call copy_currentpiece_to_rotatedpiece		;copy values for current piece into rotated piece variable
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+3]
+	sub	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+6]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpr_end
+	jz	right_rotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,2
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpr_end
+
+rpr_3:
+	call copy_currentpiece_to_rotatedpiece		;copy values for current piece into rotated piece variable
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+6]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+7]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpr_end
+	jz	rpr_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,3
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpr_end
+
+rpr_4:
+	call copy_currentpiece_to_rotatedpiece		;copy values for current piece into rotated piece variable
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+3]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+4]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex			;point to rotatedpiece variable
+	mov	al,[si+6]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	call	can_it_rotate				;check if rotated coordinates are blank
+	cmp	al,0					;if not, jmp to rpr_end
+	jz	rpr_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpr_end
+
+rpr_end:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+;**********************************************
+rotate_piece_s:
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	al,15
+	mov	ah,23
+	mov	bl,7
+	mov	bh,'3'				
+	call	setpixel
+
+	mov	si,offset curr_direction
+	mov	al,[si]
+
+	cmp	al,0
+	jz	rps_1
+
+	cmp	al,1
+	jz	rotates2
+
+	cmp	al,2
+	jz	rotates3
+
+	cmp	al,3
+	jz	rotates4
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rps_end
+
+rotates2:
+	jmp	rps_2
+
+rotates3:
+	jmp	rps_3
+
+rotates4:
+	jmp	rps_4
+
+rps_1:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+2]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	sub	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+5]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	srotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,1
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rps_end
+
+srotation_denied:
+	jmp	rps_end
+
+rps_2:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+1]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+1],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+4]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+6]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	srotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,2
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rps_end
+
+rps_3:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+5]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	rps_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,3
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rps_end
+
+rps_4:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+1]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+1],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+4]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+6]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	sub	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	rps_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rps_end
+
+rps_end:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+;**********************************************
+rotate_piece_z:
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	al,15
+	mov	ah,24
+	mov	bl,7
+	mov	bh,'4'				
+	call	setpixel
+
+	mov	si,offset curr_direction
+	mov	al,[si]
+
+	cmp	al,0
+	jz	rpz_1
+
+	cmp	al,1
+	jz	rotatez2
+
+	cmp	al,2
+	jz	rotatez3
+
+	cmp	al,3
+	jz	rotatez4
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpz_end
+
+rotatez2:
+	jmp	rpz_2
+
+rotatez3:
+	jmp	rpz_3
+
+rotatez4:
+	jmp	rpz_4
+
+rpz_1:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+1]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+1],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+4]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+5]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	z_rotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,1
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpz_end
+
+z_rotation_denied:
+	jmp	rpz_end
+
+rpz_2:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+1]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+1],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+5]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	z_rotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,2
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpz_end
+
+rpz_3:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+1]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+1],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+4]
+	sub	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+5]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	rpz_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,3
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpz_end
+rpz_4:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si]
+	sub	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+1]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+1],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+5]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	rpz_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpz_end
+
+rpz_end:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+;**********************************************
+rotate_piece_t:
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+;
+	mov	al,15
+	mov	ah,25
+	mov	bl,7
+	mov	bh,'5'				
+	call	setpixel
+
+	mov	si,offset curr_direction
+	mov	al,[si]
+
+	cmp	al,0
+	jz	rpt_1
+
+	cmp	al,1
+	jz	rotatet2
+
+	cmp	al,2
+	jz	rotatet3
+
+	cmp	al,3
+	jz	rotatet4
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpt_end
+
+rotatet2:
+	jmp	rpt_2
+
+rotatet3:
+	jmp	rpt_3
+
+rotatet4:
+	jmp	rpt_4
+
+rpt_1:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+2]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+4]
+	add	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+5]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	t_rotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,1
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpt_end
+
+t_rotation_denied:
+	jmp	rpt_end
+
+rpt_2:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+2]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+4]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+6]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	t_rotation_denied
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,2
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpt_end
+
+rpt_3:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+4]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+4],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+6]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+7]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+7],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	rpt_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,3
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpt_end
+
+rpt_4:
+	call	copy_currentpiece_to_rotatedpiece
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+2]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+2],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+3]
+	add	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+3],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+5]
+	sub	al,1
+	mov	si,offset rotatedpiecex
+	mov	[si+5],al
+
+	mov	si,offset rotatedpiecex
+	mov	al,[si+6]
+	sub	al,2
+	mov	si,offset rotatedpiecex
+	mov	[si+6],al
+
+	call	can_it_rotate
+	cmp	al,0
+	jz	rpt_end
+	call	hide_current_piece
+	call	copy_rotatedpiece_to_currentpiece
+	call	show_current_piece
+
+	mov	al,0
+	mov	si,offset curr_direction
+	mov	[si],al
+	jmp	rpt_end
+
+rpt_end:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+
+;**********************************************
+; inputs: al = row number to check
+; output: bl = 0 = the row is NOT all white
+;	  bl = 1 = the whole row is white, meaning filled up
+
+check_all_columns_in_row:
+	push	si
+	push	ax
+	push	es
+	push	ds
+
+; the game board is 10 columns wide, 1st column is 1, not 0!
+;
+	mov	dl,1			;init counter
+
+check_all_columns_in_row_loop1:
+	cmp	dl,11				;have we checked all columns
+	jz	check_all_columns_in_row_filled ;if we have, they all must be filled
+
+	mov	ah,dl				;put col number into ah, al has row
+	call	getpixel			;get current color of pixel
+	cmp	bl,0				;if it's 0, it's black, abort!
+	jz	check_all_columns_in_row_abort
+	add	dl,1				;increment counter, check next column
+	jmp	check_all_columns_in_row_loop1
+
+check_all_columns_in_row_abort:
+	mov	bl,0
+	jmp	check_all_columns_in_row_end
+
+check_all_columns_in_row_filled:
+	mov	bl,1
+
+check_all_columns_in_row_end:
+	pop	ds
+	pop	es
+	pop	ax
+	pop	si
+	ret
+
+;**********************************************
+; input = al = destination row, bl = source row
+; output = copies all the pixel color values from source row to dest row
+;	 NOTE: this function does NOT change the source row! Only changes the dest row!
+
+copy_pixels:
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+	push	dx
+
+	mov	dl,bl				;save source row in dl
+	mov	dh,al				;save dest row in dh
+
+;START OF defensive code!
+	cmp	dl,0
+	jz	copy_pixels_done		;source row CANNOT BE ZERO
+	cmp	dl,21
+	jge	copy_pixels_done		;source row CANNOT BE GREATER THAN 20
+
+	cmp	dh,0
+	jz	copy_pixels_done		;dest row CANNOT BE ZERO
+	cmp	dh,21
+	jge	copy_pixels_done		;dest row CANNOT BE GREATER THAN 20
+
+;END OF defensive code
+	
+	mov	ah,1				;start with column 1
+
+copy_pixels_loop:		
+	cmp	ah,11				;check if all columns have been done
+	jz	copy_pixels_done
+	mov	al,dl				;set source row
+	call	getpixel			;get the color of the current pixel
+						;bl now contains the color
+	mov	al,dh				;set dest row 
+	call	setpixel_ast
+	add	ah,1				;add 1 to do the next column
+	jmp	copy_pixels_loop	
+
+copy_pixels_done:
+	pop	dx
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+
+;**********************************************
+; input = none
+; ouput: special purpose function, only puts all blanks in row 1
+
+blank_out_row_one:
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+
+	mov	al,1			;row is always 1 for this function
+	mov	bl,0			;color is always black
+	mov	ah,1			;start with column 1
+
+blank_out_loop:
+	cmp	ah,11
+	je	blank_out_done
+	call	setpixel_ast
+	add	ah,1
+	jmp	blank_out_loop
+
+blank_out_done:
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+
+;**********************************************
+; inputs: none
+; outputs: full rows in the game board are cleared. remaining rows are moved down
+;
+check_for_full_rows:
+	push	si
+	push	ax
+	push	bx
+	push	es
+	push	ds
+	push	dx
+						;first initialize 3 variables we will use
+	mov	si,offset current_row
+	mov	al,20				;start with row 20, last row on board
+	mov	[si],al
+
+check_for_full_rows_loop1:			;if the current row is not zero,
+	mov	si,offset current_row
+	mov	al,[si]
+	cmp	al,0
+	jz	check_for_full_rows_exit	;jmp if row zero - we've reached the end
+	
+	call	check_all_columns_in_row	;al still has current row - check it
+	cmp	bl,0				;if the current row is all filled,
+	jz	check_for_full_rows_else2
+
+	;program goes here if the current row is filled
+
+	cmp	al,1				;check if we are at row 1 - this is a special, exceptional case. defensive code
+	je	check_for_full_rows_row_one
+
+	;program goes here if current row is filled and current row is > 1
+	;at this point, al = current_row
+
+	push	ax				;save current row on the stack
+						;al will now be used as destination row
+						;bl will be source row
+	mov	bl,al
+	sub	bl,1				;source row is initially current row - 1
+
+check_for_full_rows_loop2:
+	cmp	bl,0				;if source row is zero, we have reached the top of the game board
+	jz	check_for_full_rows_next1	;jmp if we reached the top of the board
+
+	call	copy_pixels			;shift everything down 1 row
+	sub	al,1				;subtract 1 from dest row
+	sub	bl,1				;subtract 1 from source row
+	jmp	check_for_full_rows_loop2
+
+check_for_full_rows_next1:
+	pop	ax				;restore current row in AL
+	call	blank_out_row_one		;call a new, specialized function, to just blank out the 1st row
+	jmp	check_for_full_rows_loop1
+
+check_for_full_rows_row_one:
+	call	blank_out_row_one		;call a new, specialized function, to just blank out the 1st row
+
+check_for_full_rows_else2:			;current row is NOT all filled
+	sub	al,1    			;move up 1 row and iterate
+	mov	si,offset current_row
+	mov	[si],al
+	jmp	check_for_full_rows_loop1
+	
+check_for_full_rows_exit:
+	pop	dx
+	pop	ds
+	pop	es
+	pop	bx
+	pop	ax
+	pop	si
+	ret
+
+;**********************************************
+code	ends
+	end	start
